@@ -10,6 +10,7 @@ FastSAM 葡萄分割 - 改进版 v3
 import os
 import sys
 import gc
+import argparse
 import urllib.request
 from pathlib import Path
 from collections import defaultdict
@@ -279,6 +280,281 @@ def draw_label_box(img_bgr, mask, text, color_bgr, font_scale=1.0):
                 font, font_scale, color_bgr, lw, cv2.LINE_AA)
 
 
+def run_camera():
+    """实时相机分割模式（优先使用 Intel RealSense D405，失败时回退到 OpenCV）"""
+    import cv2
+    import numpy as np
+    import subprocess
+    import time
+
+    download_model()
+
+    try:
+        from ultralytics import FastSAM
+    except ImportError:
+        print("[✗] ultralytics 未安装，请先运行: pip install ultralytics")
+        sys.exit(1)
+
+    # ── 修复1：停止 iio-sensor-proxy 防止屏幕随相机旋转 ────────────────────
+    iio_stopped = False
+    try:
+        r = subprocess.run(
+            ["sudo", "systemctl", "stop", "iio-sensor-proxy"],
+            capture_output=True, timeout=5
+        )
+        if r.returncode == 0:
+            iio_stopped = True
+            print("[✓] 已暂停 iio-sensor-proxy（屏幕将不再随相机旋转）")
+        else:
+            # 服务不存在或已停止都属于正常
+            pass
+    except Exception:
+        pass
+    if not iio_stopped:
+        print("[i] 提示：若屏幕随相机旋转，请手动运行:")
+        print("        sudo systemctl stop iio-sensor-proxy")
+
+    # ── 连接相机 ──────────────────────────────────────────────────────────────
+    use_realsense = False
+    pipeline = None
+    cap = None
+
+    try:
+        import pyrealsense2 as rs
+
+        # 修复2：连接前 hardware_reset，清除上次残留状态
+        ctx = rs.context()
+        devices = ctx.query_devices()
+        if len(devices) == 0:
+            raise RuntimeError("未找到 RealSense 设备，请检查 USB 连接")
+        for dev in devices:
+            print(f"[→] 重置设备: {dev.get_info(rs.camera_info.name)} ...")
+            dev.hardware_reset()
+        time.sleep(2)   # 等待重枚举完成
+
+        pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        pipeline.start(cfg)
+        use_realsense = True
+        print("[✓] Intel RealSense D405 已连接（640×480 @ 30fps）")
+    except Exception as e:
+        print(f"[!] RealSense 初始化失败: {e}")
+        print("[→] 回退到 OpenCV VideoCapture（设备 0）...")
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("[✗] 无法打开任何摄像头，请检查连接")
+            sys.exit(1)
+        print("[✓] OpenCV 摄像头已打开")
+
+    # ── 加载模型 ──────────────────────────────────────────────────────────────
+    print(f"[→] 加载模型 {MODEL_FILE} ...")
+    model = FastSAM(MODEL_FILE)
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    frame_count = 0
+    save_count  = 0
+
+    # ── FPS 计算 ──────────────────────────────────────────────────────────────
+    import time
+    fps_times = []     # 存储最近的帧时间戳
+    fps_window = 30    # 用于计算平均 FPS 的帧数
+
+    # ── 模式状态 ──────────────────────────────────────────────────────────────
+    grape_only_mode = False   # 默认全局分割；按 't' 切换为仅葡萄
+
+    print("[→] 开始实时分割")
+    print("     按 'q' 退出  |  按 's' 保存当前帧到 output/")
+    print("     按 'f' 切换全屏显示  |  按 't' 切换 全局/仅葡萄 模式")
+
+    window_name = "FastSAM Real-time Segmentation (D405)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            frame_start_time = time.time()
+
+            # ── 取帧 ──────────────────────────────────────────────────────────
+            if use_realsense:
+                try:
+                    frames = pipeline.wait_for_frames(timeout_ms=5000)
+                except RuntimeError:
+                    print("[!] 帧超时，重试中...")
+                    continue
+                color_frame = frames.get_color_frame()
+                if not color_frame:
+                    continue
+                frame_bgr = np.asanyarray(color_frame.get_data())
+            else:
+                ret, frame_bgr = cap.read()
+                if not ret:
+                    print("[!] 获取帧失败，退出")
+                    break
+
+            frame_count += 1
+
+            # ── FastSAM 推理（实时模式用 640，兼顾速度与精度）────────────────
+            results = model(
+                frame_bgr,
+                device=DEVICE,
+                retina_masks=True,
+                imgsz=640,
+                conf=CONF,
+                iou=IOU,
+                verbose=False,
+            )
+
+            # ── 叠加可视化 ────────────────────────────────────────────────────
+            overlay = frame_bgr.copy()
+            result  = results[0]
+            n_masks = 0
+
+            if result.masks is not None and result.masks.data is not None:
+                masks_raw = result.masks.data.bool().cpu().numpy()
+
+                if not grape_only_mode:
+                    # ── 全局模式：直接显示所有 mask ──────────────────────────
+                    for i, mask in enumerate(masks_raw):
+                        color = PALETTE_BGR[i % len(PALETTE_BGR)]
+                        fill_mask(overlay, mask, color, 0.5)
+                        draw_halo_contour(overlay, mask, color, thick=2)
+                    n_masks = len(masks_raw)
+                else:
+                    # ── 葡萄模式：HSV 颜色 + 形态过滤，保留疑似葡萄的 mask ──
+                    H_fr, W_fr = frame_bgr.shape[:2]
+                    total_px   = H_fr * W_fr
+                    frame_hsv  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+                    h_ch = frame_hsv[..., 0]
+                    s_ch = frame_hsv[..., 1]
+
+                    berry_max = int(total_px * MAX_AREA_FRAC)
+                    grape_masks = []
+
+                    for m in masks_raw:
+                        area = int(m.sum())
+                        # 面积过滤
+                        if area < MIN_AREA or area > berry_max:
+                            continue
+                        # 形态过滤（排除细长物体）
+                        ar = aspect_ratio(m)
+                        if ar < MIN_BERRY_AR:
+                            continue
+                        # 颜色过滤：排除以绿叶为主的 mask
+                        h_vals = h_ch[m]
+                        s_vals = s_ch[m]
+                        green_px = ((h_vals >= EXCL_GREEN_H_MIN) &
+                                    (h_vals <= EXCL_GREEN_H_MAX) &
+                                    (s_vals >= EXCL_GREEN_SAT))
+                        if green_px.sum() / max(len(h_vals), 1) > EXCL_GREEN_FRAC:
+                            continue
+                        # Y 轴质心过滤：排除图像最底部的地面/背景
+                        ys_m = np.where(m)[0]
+                        if ys_m.mean() > GRAPE_MAX_Y_FRAC * H_fr:
+                            continue
+                        grape_masks.append(m.astype(bool))
+
+                    # 第一轮 tight 合并 + 第二轮质心聚类
+                    if grape_masks:
+                        grape_np = np.stack(grape_masks, axis=0)
+                        merged = merge_masks(grape_np, dilate_kernel=DILATE_KERNEL,
+                                             min_area=0, max_area=None,
+                                             min_berry_ar=0)
+                        merged = union_find_merge(merged, eps=BUNCH_EPS)
+                        merged = [
+                            m for m in merged
+                            if int(total_px * MIN_MERGED_FRAC)
+                            <= int(m.sum())
+                            <= int(total_px * MAX_MERGED_FRAC)
+                        ]
+                        merged.sort(key=lambda m: int(m.sum()), reverse=True)
+                    else:
+                        merged = []
+
+                    for i, mask in enumerate(merged):
+                        color = PALETTE_BGR[i % len(PALETTE_BGR)]
+                        fill_mask(overlay, mask, color, ALPHA_GRAPE)
+                        draw_halo_contour(overlay, mask, color, thick=2)
+                        draw_label_box(overlay, mask, f"C{i+1}", color,
+                                       font_scale=0.7)
+                    n_masks = len(merged)
+
+            # ── 计算 FPS ──────────────────────────────────────────────────────
+            current_time = time.time()
+            fps_times.append(current_time)
+            if len(fps_times) > fps_window:
+                fps_times.pop(0)
+            fps = ((len(fps_times) - 1) / (fps_times[-1] - fps_times[0])
+                   if len(fps_times) > 1 else 0)
+
+            # ── HUD 文字 ──────────────────────────────────────────────────────
+            mode_label = "MODE: GRAPE ONLY [t]" if grape_only_mode else "MODE: ALL  [t]"
+            mode_color = (0, 200, 255) if grape_only_mode else (200, 200, 200)
+
+            cv2.putText(overlay,
+                        f"Masks: {n_masks}   Frame: {frame_count}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+                        cv2.LINE_AA)
+            cv2.putText(overlay,
+                        "q:quit  s:save  f:fullscreen  t:mode",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200),
+                        1, cv2.LINE_AA)
+            cv2.putText(overlay,
+                        mode_label,
+                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.75, mode_color, 2,
+                        cv2.LINE_AA)
+
+            # 右上角显示 FPS（青色）
+            fps_text = f"FPS: {fps:.1f}"
+            text_size = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
+            fps_x = overlay.shape[1] - text_size[0] - 10
+            cv2.putText(overlay,
+                        fps_text,
+                        (fps_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2,
+                        cv2.LINE_AA)
+
+            cv2.imshow(window_name, overlay)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('t'):
+                grape_only_mode = not grape_only_mode
+                label = "仅葡萄" if grape_only_mode else "全局"
+                print(f"[→] 切换模式 → {label}")
+            elif key == ord('s'):
+                save_count += 1
+                save_path = os.path.join(OUTPUT_DIR,
+                                         f"camera_frame_{save_count:04d}.png")
+                cv2.imwrite(save_path, overlay)
+                print(f"[✓] 已保存: {save_path}")
+            elif key == ord('f'):
+                cur = cv2.getWindowProperty(window_name,
+                                            cv2.WND_PROP_FULLSCREEN)
+                next_state = (cv2.WINDOW_FULLSCREEN
+                              if cur != cv2.WINDOW_FULLSCREEN
+                              else cv2.WINDOW_NORMAL)
+                cv2.setWindowProperty(window_name,
+                                      cv2.WND_PROP_FULLSCREEN, next_state)
+
+    finally:
+        if use_realsense and pipeline is not None:
+            pipeline.stop()
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+        # 恢复 iio-sensor-proxy
+        if iio_stopped:
+            try:
+                subprocess.run(
+                    ["sudo", "systemctl", "start", "iio-sensor-proxy"],
+                    capture_output=True, timeout=5
+                )
+                print("[✓] iio-sensor-proxy 已恢复")
+            except Exception:
+                pass
+        print(f"\n[✓] 已退出  共处理 {frame_count} 帧，保存 {save_count} 张")
+
+
 def main():
     # 1. 确认输入图像
     if not Path(IMAGE_PATH).exists():
@@ -494,4 +770,27 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="FastSAM 分割工具")
+    parser.add_argument(
+        "--mode",
+        choices=["image", "camera"],
+        default=None,
+        help="运行模式：image（图像文件分割）或 camera（D405 实时分割）",
+    )
+    args = parser.parse_args()
+
+    if args.mode is None:
+        print("══════════════════════════════════════")
+        print("  FastSAM 分割工具 — 请选择运行模式")
+        print("══════════════════════════════════════")
+        print("  1. 图像分割   (image)  — 处理静态图片")
+        print("  2. 实时摄像头 (camera) — Intel RealSense D405 实时分割")
+        print("──────────────────────────────────────")
+        choice = input("请输入 1 或 2（默认 1）: ").strip()
+        args.mode = "camera" if choice == "2" else "image"
+        print()
+
+    if args.mode == "camera":
+        run_camera()
+    else:
+        main()
